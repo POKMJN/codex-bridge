@@ -31,6 +31,13 @@ print(f"[PROXY] Loaded model: {DEFAULT_MODEL}")
 
 app = FastAPI()
 
+# Optional: load WeChat webhook router if available
+try:
+    from routes.wechat import router as wechat_router
+    app.include_router(wechat_router)
+except Exception as e:
+    print(f"[INFO] WeChat router not loaded: {e}")
+
 ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.minimaxi.com/anthropic")
 
 
@@ -265,33 +272,6 @@ def anthropic_to_openai_stream(event, msg_id=None, model=None, state=None):
             sse += f"data: {json.dumps({'type': 'response.content_part.added', 'item_id': item_id, 'output_index': out_idx, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
             return msg_id, model, sse, state
 
-        elif block.type == "tool_use":
-            out_idx = state["output_index_counter"]
-            state["output_index_counter"] += 1
-            state["idx_to_output_index"][idx] = out_idx
-
-            call_id = block.id
-            tool_name = block.name
-            state["tool_use_indices"][idx] = {
-                "id": call_id,
-                "name": tool_name,
-                "arguments": "",
-            }
-            item_id = f"fc_{msg_id}_{out_idx}"
-            item = {
-                "type": "function_call",
-                "id": item_id,
-                "call_id": call_id,
-                "name": tool_name,
-                "arguments": "",
-                "status": "in_progress",
-            }
-            sse = f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': out_idx, 'item': item})}\n\n"
-            return msg_id, model, sse, state
-
-        elif block.type == "thinking":
-            return msg_id, model, "", state
-
     elif event_type == "content_block_delta":
         delta = event.delta
         idx = event.index
@@ -309,65 +289,6 @@ def anthropic_to_openai_stream(event, msg_id=None, model=None, state=None):
                 "delta": text,
             }
             return msg_id, model, f"data: {json.dumps(data)}\n\n", state
-
-        elif delta.type == "input_json_delta":
-            json_chunk = getattr(delta, "partial_json", "") or ""
-            if idx in state["tool_use_indices"]:
-                state["tool_use_indices"][idx]["arguments"] += json_chunk
-            out_idx = state["idx_to_output_index"].get(idx, idx)
-            data = {
-                "type": "response.function_call_arguments.delta",
-                "item_id": f"fc_{msg_id}_{out_idx}",
-                "output_index": out_idx,
-                "delta": json_chunk,
-            }
-            return msg_id, model, f"data: {json.dumps(data)}\n\n", state
-
-        elif delta.type == "thinking_delta":
-            return msg_id, model, "", state
-
-    elif event_type == "content_block_stop":
-        idx = event.index
-
-        # Text block 完成
-        if idx in state["text_block_indices"] and idx not in state["done_indices"]:
-            state["done_indices"].add(idx)
-            out_idx = state["idx_to_output_index"].get(idx, idx)
-            item_id = f"msg_{msg_id}_{out_idx}"
-            final_text = state["accumulated_text"].get(idx, "")
-            sse = ""
-            sse += f"data: {json.dumps({'type': 'response.output_text.done', 'item_id': item_id, 'output_index': out_idx, 'content_index': 0, 'text': final_text})}\n\n"
-            sse += f"data: {json.dumps({'type': 'response.content_part.done', 'item_id': item_id, 'output_index': out_idx, 'content_index': 0, 'part': {'type': 'output_text', 'text': final_text}})}\n\n"
-            sse += f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': out_idx, 'item': {'id': item_id, 'type': 'message', 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': final_text}]}})}\n\n"
-            return msg_id, model, sse, state
-
-        # Tool use block 完成
-        elif idx in state["tool_use_indices"]:
-            state["done_indices"].add(idx)
-            out_idx = state["idx_to_output_index"].get(idx, idx)
-            tool_info = state["tool_use_indices"][idx]
-            full_args = tool_info["arguments"]
-            call_id = tool_info["id"]
-            item_id = f"fc_{msg_id}_{out_idx}"
-            sse = ""
-            sse += f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'item_id': item_id, 'output_index': out_idx, 'arguments': full_args})}\n\n"
-            item = {
-                "type": "function_call",
-                "id": item_id,
-                "call_id": call_id,
-                "name": tool_info["name"],
-                "arguments": full_args,
-                "status": "completed",
-            }
-            sse += f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': out_idx, 'item': item})}\n\n"
-            return msg_id, model, sse, state
-
-        return msg_id, model, "", state
-
-    elif event_type == "message_delta":
-        if hasattr(event, 'usage') and event.usage:
-            state["usage"]["output_tokens"] = getattr(event.usage, 'output_tokens', 0)
-        return msg_id, model, "", state
 
     elif event_type == "message_stop":
         # 构建完整的 response.completed 事件
@@ -413,7 +334,6 @@ def anthropic_to_openai_stream(event, msg_id=None, model=None, state=None):
             "output": output,
             "usage": usage,
         }
-
         data = {
             "type": "response.completed",
             "response": response_obj,
